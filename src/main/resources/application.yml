@@ -10,6 +10,8 @@ spring:
     name: seat-reservation
   lifecycle:
     timeout-per-shutdown-phase: 20s
+  jackson:
+    property-naming-strategy: SNAKE_CASE   # API uses snake_case everywhere (price_paise, user_id...)
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/seats?reWriteBatchedInserts=true}
     username: ${DB_USER:seats}
@@ -20,6 +22,15 @@ spring:
       connection-timeout: 10000
   flyway:
     enabled: true
+
+app:
+  jwt:
+    # HS256 key, must be >= 32 bytes. Set JWT_SECRET in any real deployment.
+    secret: ${JWT_SECRET:dev-only-secret-change-me-dev-only-secret-change-me}
+    ttl-seconds: ${JWT_TTL_SECONDS:43200}
+  admin:
+    # Presented to POST /auth/token to receive an ADMIN token. Documented in the README.
+    secret: ${ADMIN_SECRET:admin-secret-change-me}
 
 management:
   endpoints:
