@@ -34,6 +34,7 @@ public class ReservationService {
 
     private record ShowInfo(long pricePaise, int perUserLimit) {}
     private record IdemRow(String requestHash, String outcome, UUID reservationId, String declineReason) {}
+    private record ReservationRow(String userId, UUID showId, String status, int seatCount) {}
 
     /** Returns 1 if this request now owns the key, 0 if the key already exists (committed by someone else). */
     private static final String IDEM_INSERT = """
@@ -248,6 +249,48 @@ public class ReservationService {
         }
         showCache.put(showId, rows.get(0));
         return rows.get(0);
+    }
+
+    /**
+     * Cancel: ownership and current status are checked IN the UPDATE's WHERE clause, so the
+     * decision is atomic. Matching by reservation_id (not by seat label) means a seat already
+     * re-confirmed to someone else under a NEW reservation_id can never be touched by a stale
+     * cancel of the old one.
+     */
+    private static final String RELEASE_SEATS_SQL = """
+        UPDATE seats SET status = 'available', reservation_id = NULL, user_id = NULL
+        WHERE reservation_id = ?
+        """;
+
+    public CancelOutcome cancel(UUID reservationId, String userId) {
+        return txTemplate.execute(status -> {
+            // Row lock here serializes a double-cancel race: the second caller waits, then sees
+            // status already 'cancelled' and declines cleanly instead of double-releasing seats.
+            List<ReservationRow> rows = jdbc.query(
+                "SELECT user_id, show_id, status, cardinality(seats) AS n "
+              + "FROM reservations WHERE id = ? FOR UPDATE",
+                (rs, i) -> new ReservationRow(rs.getString(1), rs.getObject(2, UUID.class),
+                        rs.getString(3), rs.getInt(4)),
+                reservationId);
+            if (rows.isEmpty()) {
+                return new CancelOutcome(404, "reservation_not_found", "reservation not found");
+            }
+            ReservationRow row = rows.get(0);
+            if (!row.userId().equals(userId)) {
+                // Do not reveal whether the id exists to someone who does not own it.
+                return new CancelOutcome(404, "reservation_not_found", "reservation not found");
+            }
+            if ("cancelled".equals(row.status())) {
+                return new CancelOutcome(409, "already_cancelled", "this reservation was already cancelled");
+            }
+
+            jdbc.update("UPDATE reservations SET status = 'cancelled', cancelled_at = now() WHERE id = ?",
+                    reservationId);
+            jdbc.update(RELEASE_SEATS_SQL, reservationId);
+            jdbc.update("UPDATE user_show_quota SET held = held - ? WHERE show_id = ? AND user_id = ?",
+                    row.seatCount(), row.showId(), userId);
+            return new CancelOutcome(200, null, null);
+        });
     }
 
     /** Same show and same seat set (in any order) = same request. Labels cannot contain ','. */

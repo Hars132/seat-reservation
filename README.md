@@ -65,4 +65,14 @@ The idempotency key may be sent as header `Idempotency-Key` or body field `idemp
 - Duplicate labels inside one request are rejected (400).
 - Identity is the token's user; a `user_id` in the body is ignored.
 
+## Cancel
+```
+curl -s -X POST localhost:8080/reservations/<reservation_id>/cancel -H "Authorization: Bearer <token>"
+```
+Only the owner may cancel (anyone else, or an unknown id, gets `404 reservation_not_found` - the API
+never reveals that a reservation exists if it isn't yours). Cancelling an already-cancelled reservation
+is `409 already_cancelled`. On success the seats return to `available` and the user's quota is released.
+Matching is by `reservation_id`, not seat label, so a stale/late cancel can never release a seat that
+has since been re-confirmed under a new reservation.
+
 (More sections - API, burst script, metrics, deploy - are added as the build progresses.)
