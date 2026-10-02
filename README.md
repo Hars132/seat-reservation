@@ -55,9 +55,13 @@ curl -s -X POST localhost:8080/shows/<id>/reserve -H "Authorization: Bearer <tok
      -H 'Content-Type: application/json' \
      -d '{"seats":["A12"],"idempotency_key":"order-1"}'
 ```
-The idempotency key may be sent as header `Idempotency-Key` or body field `idempotency_key` (required).
-- `201` reserved. `409 seat_taken` a seat is already taken. `404 unknown_seat` / `show_not_found`. `400` invalid request.
+The idempotency key may be sent as header `Idempotency-Key` or body field `idempotency_key` (required, scoped per user).
+- `201` reserved. `409 seat_taken`, `409 per_user_limit`, `409 idempotency_conflict`. `404 unknown_seat` / `show_not_found`. `400` invalid request.
 - **Multi-seat requests are all-or-nothing**: you get every seat you asked for or none.
+- **Per-user limit** (`per_user_limit`, default 4) is per show and holds under concurrency. It is checked before seat availability.
+- **Idempotency**: the same key with the same seats (any order) returns the ORIGINAL response (same status and body) with header
+  `Idempotent-Replay: true`, and changes nothing. The same key with different seats is `409 idempotency_conflict`.
+  A declined attempt is remembered too: retrying that key replays the same decline. Use a new key to try again.
 - Duplicate labels inside one request are rejected (400).
 - Identity is the token's user; a `user_id` in the body is ignored.
 

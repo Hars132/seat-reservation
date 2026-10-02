@@ -11,6 +11,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -44,6 +45,14 @@ abstract class ApiTestBase {
         registry.add("spring.datasource.url", pg::getJdbcUrl);
         registry.add("spring.datasource.username", pg::getUsername);
         registry.add("spring.datasource.password", pg::getPassword);
+    }
+
+    // The container (and the Spring context, and the DB) is shared across every test class in the
+    // run, so leftover rows from one test can collide with another (e.g. the same idempotency key
+    // reused for a different show). Reset before each test method for full isolation.
+    @BeforeEach
+    void resetDatabase() {
+        jdbc.update("TRUNCATE TABLE idempotency, user_show_quota, reservations, seats, shows RESTART IDENTITY CASCADE");
     }
 
     @Autowired protected TestRestTemplate rest;

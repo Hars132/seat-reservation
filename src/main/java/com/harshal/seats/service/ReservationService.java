@@ -1,8 +1,10 @@
 package com.harshal.seats.service;
 
 import com.harshal.seats.web.ApiException;
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -14,24 +16,52 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 
+/**
+ * One reserve = one database transaction. The order of steps is the design:
+ *
+ *   1. idempotency key  (unique row; duplicates wait here, then replay the stored result)
+ *   2. SAVEPOINT        (everything below can be undone while the key row survives)
+ *   3. per-user quota   (conditional upsert; serialises one user's parallel requests)
+ *   4. seat claim       (conditional update; sorted row locks; all-or-nothing)
+ *   5. reservation row, key row marked confirmed, COMMIT
+ *
+ * A domain decline rolls back to the savepoint, marks the key row 'declined', and commits, so the
+ * key is remembered. An infrastructure failure rolls back everything, key row included, so the
+ * client can safely retry. Lock order is always key -> quota -> seats (sorted), so it cannot cycle.
+ */
 @Service
 public class ReservationService {
 
     private record ShowInfo(long pricePaise, int perUserLimit) {}
+    private record IdemRow(String requestHash, String outcome, UUID reservationId, String declineReason) {}
+
+    /** Returns 1 if this request now owns the key, 0 if the key already exists (committed by someone else). */
+    private static final String IDEM_INSERT = """
+        INSERT INTO idempotency(user_id, idem_key, request_hash) VALUES (?, ?, ?)
+        ON CONFLICT (user_id, idem_key) DO NOTHING
+        """;
 
     /**
-     * THE ATOMIC DECISION. One statement locks and claims in a single step:
-     *
-     *  1. claimable: pick the requested seats that are CURRENTLY available and lock them
-     *     (FOR UPDATE), in ascending label order. Every transaction locks in the same global
-     *     order, so two multi-seat requests can never wait on each other in a cycle: no deadlock.
-     *     A transaction blocked on a locked row wakes up when the holder commits or rolls back and
-     *     RE-CHECKS status = 'available' on the latest row version (READ COMMITTED). If the holder
-     *     confirmed it, the row drops out. If the holder rolled back, we get it.
-     *  2. UPDATE ... WHERE status = 'available': the write is itself guarded on current state, so
-     *     even in theory it cannot flip a seat that is not available. There is no read-then-write.
-     *  3. RETURNING gives exactly the seats this transaction won. If that is fewer than requested,
-     *     the caller rolls back, which releases any seats it did win: all-or-nothing.
+     * Atomic per-user limit. Insert the first time; on conflict add to the counter ONLY IF the result
+     * stays within the limit. The row lock taken by ON CONFLICT DO UPDATE serialises this user's
+     * concurrent requests, and the WHERE is re-checked against the latest committed row after the
+     * wait. No row returned = over the limit. (The insert path skips the WHERE, so the caller checks
+     * seats <= limit before calling.)
+     */
+    private static final String QUOTA_SQL = """
+        INSERT INTO user_show_quota(show_id, user_id, held) VALUES (CAST(? AS uuid), ?, ?)
+        ON CONFLICT (show_id, user_id) DO UPDATE
+           SET held = user_show_quota.held + EXCLUDED.held
+         WHERE user_show_quota.held + EXCLUDED.held <= ?
+        RETURNING held
+        """;
+
+    /**
+     * THE ATOMIC DECISION. Lock the requested seats that are currently available, in ascending label
+     * order (global lock order = no deadlock), then flip exactly those rows with an UPDATE that is
+     * itself guarded on status = 'available'. RETURNING gives the seats this transaction won; fewer
+     * than requested means the caller undoes everything (all-or-nothing). A transaction waiting on a
+     * locked row re-checks status on the latest row version once the holder finishes.
      */
     private static final String CLAIM_SQL = """
         WITH claimable AS (
@@ -52,7 +82,7 @@ public class ReservationService {
         """;
 
     private final JdbcTemplate jdbc;
-    private final TransactionTemplate tx;
+    private final TransactionTemplate txTemplate;
     private final Semaphore gate;
     private final long queueTimeoutMs;
     // Price and per-user limit never change after creation, so caching them is safe.
@@ -60,23 +90,139 @@ public class ReservationService {
     private final ConcurrentHashMap<UUID, ShowInfo> showCache = new ConcurrentHashMap<>();
 
     public ReservationService(JdbcTemplate jdbc,
-                              TransactionTemplate tx,
+                              TransactionTemplate txTemplate,
                               @Value("${app.reserve.max-concurrency:16}") int maxConcurrency,
                               @Value("${app.reserve.queue-timeout-ms:20000}") long queueTimeoutMs) {
         this.jdbc = jdbc;
-        this.tx = tx;
+        this.txTemplate = txTemplate;
         this.gate = new Semaphore(maxConcurrency, true);
         this.queueTimeoutMs = queueTimeoutMs;
     }
 
     /** Waits in memory (not on a DB connection) when the system is saturated. */
-    public ReserveOutcome reserve(UUID showId, String userId, List<String> seats) {
+    public ReserveOutcome reserve(UUID showId, String userId, String idempotencyKey, List<String> seats) {
+        String hash = requestHash(showId, seats);
         acquire();
         try {
-            return tx.execute(status -> doReserve(status, showId, userId, seats));
+            return txTemplate.execute(status -> doReserve(status, showId, userId, idempotencyKey, hash, seats));
         } finally {
             gate.release();
         }
+    }
+
+    private ReserveOutcome doReserve(TransactionStatus status, UUID showId, String userId,
+                                     String key, String hash, List<String> seats) {
+        ShowInfo show = showInfo(showId);
+
+        // 1. Idempotency. A concurrent duplicate blocks inside this INSERT until the first
+        //    transaction commits, then gets 0 rows and replays the stored result.
+        int inserted = jdbc.update(IDEM_INSERT, ps -> {
+            ps.setString(1, userId);
+            ps.setString(2, key);
+            ps.setString(3, hash);
+        });
+        if (inserted == 0) {
+            return replay(userId, key, hash);
+        }
+
+        // 2. From here on a domain decline can be undone without losing the key row.
+        Object savepoint = status.createSavepoint();
+        int n = seats.size();
+        String[] labels = seats.toArray(new String[0]);
+
+        // 3. Per-user limit.
+        if (n > show.perUserLimit()) {
+            return decline(status, savepoint, userId, key, "per_user_limit");
+        }
+        List<Integer> quota = jdbc.query(QUOTA_SQL, ps -> {
+            ps.setObject(1, showId);
+            ps.setString(2, userId);
+            ps.setInt(3, n);
+            ps.setInt(4, show.perUserLimit());
+        }, (rs, i) -> rs.getInt(1));
+        if (quota.isEmpty()) {
+            return decline(status, savepoint, userId, key, "per_user_limit");
+        }
+
+        // 4. Atomic seat claim.
+        UUID reservationId = UUID.randomUUID();
+        List<String> claimed = jdbc.query(CLAIM_SQL, ps -> {
+            ps.setObject(1, showId);
+            ps.setArray(2, ps.getConnection().createArrayOf("text", labels));
+            ps.setObject(3, reservationId);
+            ps.setString(4, userId);
+            ps.setObject(5, showId);
+        }, (rs, i) -> rs.getString(1));
+        if (claimed.size() != n) {
+            // Undoes the quota increment and any seats this transaction did win.
+            return decline(status, savepoint, userId, key, diagnose(showId, labels));
+        }
+
+        // 5. Record the reservation and finalise the key.
+        long amount = Math.multiplyExact(show.pricePaise(), (long) n);
+        jdbc.update("INSERT INTO reservations(id, show_id, user_id, seats, amount_paise, status) "
+                  + "VALUES (?, ?, ?, ?, ?, 'confirmed')", ps -> {
+            ps.setObject(1, reservationId);
+            ps.setObject(2, showId);
+            ps.setString(3, userId);
+            ps.setArray(4, ps.getConnection().createArrayOf("text", labels));
+            ps.setLong(5, amount);
+        });
+        jdbc.update("UPDATE idempotency SET outcome = 'confirmed', reservation_id = ? "
+                  + "WHERE user_id = ? AND idem_key = ?", reservationId, userId, key);
+
+        return new ReserveOutcome.Created(new ReservationView(
+                reservationId.toString(), showId.toString(), userId, List.copyOf(seats), amount, "confirmed"), false);
+    }
+
+    /** Undo this attempt's writes, but keep the key row and mark it declined so the decline is remembered. */
+    private ReserveOutcome decline(TransactionStatus status, Object savepoint,
+                                   String userId, String key, String reason) {
+        status.rollbackToSavepoint(savepoint);
+        jdbc.update("UPDATE idempotency SET outcome = 'declined', decline_reason = ? "
+                  + "WHERE user_id = ? AND idem_key = ?", reason, userId, key);
+        return new ReserveOutcome.Declined(statusFor(reason), reason, messageFor(reason), false);
+    }
+
+    /** The key already exists: same request replays the stored result, a different request is a conflict. */
+    private ReserveOutcome replay(String userId, String key, String hash) {
+        List<IdemRow> rows = jdbc.query(
+            "SELECT request_hash, outcome, reservation_id, decline_reason FROM idempotency "
+          + "WHERE user_id = ? AND idem_key = ?",
+            (rs, i) -> new IdemRow(rs.getString(1), rs.getString(2), rs.getObject(3, UUID.class), rs.getString(4)),
+            userId, key);
+        if (rows.isEmpty()) {
+            throw new ApiException(503, "overloaded", "request is still being processed, retry shortly");
+        }
+        IdemRow row = rows.get(0);
+        if (!row.requestHash().equals(hash)) {
+            return new ReserveOutcome.Declined(409, "idempotency_conflict", messageFor("idempotency_conflict"), false);
+        }
+        return switch (row.outcome()) {
+            case "confirmed" -> new ReserveOutcome.Created(loadReservation(row.reservationId()), true);
+            case "declined" -> new ReserveOutcome.Declined(
+                    statusFor(row.declineReason()), row.declineReason(), messageFor(row.declineReason()), true);
+            default -> throw new ApiException(503, "overloaded", "request is still being processed, retry shortly");
+        };
+    }
+
+    private ReservationView loadReservation(UUID id) {
+        return jdbc.query(
+            "SELECT id, show_id, user_id, seats, amount_paise, status FROM reservations WHERE id = ?",
+            (rs, i) -> new ReservationView(rs.getString(1), rs.getString(2), rs.getString(3),
+                    List.of((String[]) rs.getArray(4).getArray()), rs.getLong(5), rs.getString(6)),
+            id).get(0);
+    }
+
+    /** Failure path only: tell "no such seat" apart from "someone has it". Seat labels are immutable. */
+    private String diagnose(UUID showId, String[] labels) {
+        int existing = jdbc.query(
+            "SELECT count(*) FROM seats WHERE show_id = ? AND label = ANY(CAST(? AS text[]))",
+            ps -> {
+                ps.setObject(1, showId);
+                ps.setArray(2, ps.getConnection().createArrayOf("text", labels));
+            }, (rs, i) -> rs.getInt(1)).get(0);
+        return existing < labels.length ? "unknown_seat" : "seat_taken";
     }
 
     private void acquire() {
@@ -88,53 +234,6 @@ public class ReservationService {
             Thread.currentThread().interrupt();
             throw new ApiException(503, "overloaded", "request interrupted, retry shortly");
         }
-    }
-
-    private ReserveOutcome doReserve(TransactionStatus status, UUID showId, String userId, List<String> seats) {
-        ShowInfo show = showInfo(showId);
-        UUID reservationId = UUID.randomUUID();
-        String[] labels = seats.toArray(new String[0]);
-
-        List<String> claimed = jdbc.query(CLAIM_SQL, ps -> {
-            ps.setObject(1, showId);
-            ps.setArray(2, ps.getConnection().createArrayOf("text", labels));
-            ps.setObject(3, reservationId);
-            ps.setString(4, userId);
-            ps.setObject(5, showId);
-        }, (rs, i) -> rs.getString(1));
-
-        if (claimed.size() != labels.length) {
-            status.setRollbackOnly(); // releases whatever this transaction did win
-            return decline(showId, labels);
-        }
-
-        long amount = Math.multiplyExact(show.pricePaise(), (long) labels.length);
-        jdbc.update("INSERT INTO reservations(id, show_id, user_id, seats, amount_paise, status) "
-                  + "VALUES (?, ?, ?, ?, ?, 'confirmed')", ps -> {
-            ps.setObject(1, reservationId);
-            ps.setObject(2, showId);
-            ps.setString(3, userId);
-            ps.setArray(4, ps.getConnection().createArrayOf("text", labels));
-            ps.setLong(5, amount);
-        });
-        return new ReserveOutcome.Created(new ReservationView(
-                reservationId.toString(), showId.toString(), userId, List.copyOf(seats), amount, "confirmed"));
-    }
-
-    /** Runs only on the failure path: tell "no such seat" apart from "someone has it". */
-    private ReserveOutcome decline(UUID showId, String[] labels) {
-        int existing = jdbc.query(
-            "SELECT count(*) FROM seats WHERE show_id = ? AND label = ANY(CAST(? AS text[]))",
-            ps -> bind(ps, showId, labels), (rs, i) -> rs.getInt(1)).get(0);
-        if (existing < labels.length) {
-            return new ReserveOutcome.Declined(404, "unknown_seat", "one or more seats do not exist in this show");
-        }
-        return new ReserveOutcome.Declined(409, "seat_taken", "one or more requested seats are already taken");
-    }
-
-    private static void bind(PreparedStatement ps, UUID showId, String[] labels) throws SQLException {
-        ps.setObject(1, showId);
-        ps.setArray(2, ps.getConnection().createArrayOf("text", labels));
     }
 
     private ShowInfo showInfo(UUID showId) {
@@ -149,5 +248,30 @@ public class ReservationService {
         }
         showCache.put(showId, rows.get(0));
         return rows.get(0);
+    }
+
+    /** Same show and same seat set (in any order) = same request. Labels cannot contain ','. */
+    static String requestHash(UUID showId, List<String> seats) {
+        String canonical = showId + "|" + String.join(",", seats.stream().sorted().toList());
+        try {
+            return HexFormat.of().formatHex(
+                MessageDigest.getInstance("SHA-256").digest(canonical.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static int statusFor(String reason) {
+        return "unknown_seat".equals(reason) ? 404 : 409;
+    }
+
+    private static String messageFor(String reason) {
+        return switch (reason) {
+            case "seat_taken" -> "one or more requested seats are already taken";
+            case "per_user_limit" -> "this reservation would exceed the per-user seat limit for the show";
+            case "unknown_seat" -> "one or more seats do not exist in this show";
+            case "idempotency_conflict" -> "this idempotency key was already used with a different request";
+            default -> "request declined";
+        };
     }
 }

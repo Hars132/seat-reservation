@@ -46,15 +46,22 @@ public class ReservationController {
         String key = resolveKey(headerKey, req.idempotencyKey());
         List<String> seats = validateSeats(req.seats());
 
-        // NOTE (step 6): `key` is validated here and enforced for exactly-once in the next step.
-        ReserveOutcome outcome = reservations.reserve(showId, principal.userId(), seats);
+        ReserveOutcome outcome = reservations.reserve(showId, principal.userId(), key, seats);
 
+        // A replay returns the ORIGINAL status and body, flagged with a header so clients can tell.
         if (outcome instanceof ReserveOutcome.Created c) {
-            return ResponseEntity.status(201).body(c.reservation());
+            ResponseEntity.BodyBuilder b = ResponseEntity.status(201);
+            if (c.replay()) {
+                b.header("Idempotent-Replay", "true");
+            }
+            return b.body(c.reservation());
         }
         ReserveOutcome.Declined d = (ReserveOutcome.Declined) outcome;
-        return ResponseEntity.status(d.httpStatus())
-                .body(Map.of("error", d.reason(), "message", d.message()));
+        ResponseEntity.BodyBuilder b = ResponseEntity.status(d.httpStatus());
+        if (d.replay()) {
+            b.header("Idempotent-Replay", "true");
+        }
+        return b.body(Map.of("error", d.reason(), "message", d.message()));
     }
 
     private static String resolveKey(String headerKey, String bodyKey) {
