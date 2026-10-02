@@ -1,0 +1,28 @@
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200            # threads > app semaphore > DB pool (tuned in the reserve step)
+
+spring:
+  application:
+    name: seat-reservation
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/seats?reWriteBatchedInserts=true}
+    username: ${DB_USER:seats}
+    password: ${DB_PASSWORD:seats}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      minimum-idle: ${DB_POOL_SIZE:20}   # fixed-size pool: no resize latency during the stampede
+      connection-timeout: 10000
+  flyway:
+    enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info
