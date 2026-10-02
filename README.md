@@ -49,4 +49,16 @@ curl -s localhost:8080/shows/<id> -H "Authorization: Bearer <token>"
 `total_seats` is stored at creation, so `available + held + confirmed == total_seats` is a real reconciliation check.
 Duplicate seat labels are rejected with 400; labels are `[A-Za-z0-9_.-]`, 1-32 chars; max 100,000 seats per show.
 
+## Reserve
+```
+curl -s -X POST localhost:8080/shows/<id>/reserve -H "Authorization: Bearer <token>" \
+     -H 'Content-Type: application/json' \
+     -d '{"seats":["A12"],"idempotency_key":"order-1"}'
+```
+The idempotency key may be sent as header `Idempotency-Key` or body field `idempotency_key` (required).
+- `201` reserved. `409 seat_taken` a seat is already taken. `404 unknown_seat` / `show_not_found`. `400` invalid request.
+- **Multi-seat requests are all-or-nothing**: you get every seat you asked for or none.
+- Duplicate labels inside one request are rejected (400).
+- Identity is the token's user; a `user_id` in the body is ignored.
+
 (More sections - API, burst script, metrics, deploy - are added as the build progresses.)

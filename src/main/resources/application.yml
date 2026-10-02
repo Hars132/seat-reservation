@@ -3,7 +3,9 @@ server:
   shutdown: graceful
   tomcat:
     threads:
-      max: 200            # threads > app semaphore > DB pool (tuned in the reserve step)
+      max: 200
+    accept-count: 8192        # queue of connections waiting for a thread: absorbs the stampede
+    max-connections: 20000
 
 spring:
   application:
@@ -22,6 +24,8 @@ spring:
       maximum-pool-size: ${DB_POOL_SIZE:20}
       minimum-idle: ${DB_POOL_SIZE:20}   # fixed-size pool: no resize latency during the stampede
       connection-timeout: 10000
+      # Safety nets on every connection: no lock wait or query may hang forever and starve the pool.
+      connection-init-sql: "SELECT set_config('lock_timeout','5s',false), set_config('statement_timeout','20s',false)"
   flyway:
     enabled: true
 
@@ -33,6 +37,11 @@ app:
   admin:
     # Presented to POST /auth/token to receive an ADMIN token. Documented in the README.
     secret: ${ADMIN_SECRET:admin-secret-change-me}
+  reserve:
+    # Max reserve transactions in flight. MUST be <= DB pool size so excess requests wait here
+    # (cheap, in memory) instead of timing out inside Hikari (which would surface as a 5xx).
+    max-concurrency: ${RESERVE_MAX_CONCURRENCY:16}
+    queue-timeout-ms: 20000
 
 management:
   endpoints:

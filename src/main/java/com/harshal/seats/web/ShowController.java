@@ -26,7 +26,7 @@ public class ShowController {
 
     public record CreateShowRequest(String name, List<String> seats, Long pricePaise, Integer perUserLimit) {}
 
-    private static final Pattern LABEL = Pattern.compile("[A-Za-z0-9_.-]{1,32}");
+    static final Pattern LABEL = Pattern.compile("[A-Za-z0-9_.-]{1,32}");
     private static final int MAX_SEATS = 100_000;
     private static final long MAX_PRICE_PAISE = 1_000_000_000_000L;
     static final int DEFAULT_PER_USER_LIMIT = 4;
