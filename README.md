@@ -75,4 +75,25 @@ is `409 already_cancelled`. On success the seats return to `available` and the u
 Matching is by `reservation_id`, not seat label, so a stale/late cancel can never release a seat that
 has since been re-confirmed under a new reservation.
 
+## Burst test (one command)
+`Burst.java` reproduces the on-sale stampede against a live (or local) URL: a general stampede with
+far more requests than seats, a 500-user hot-seat storm on one seat, a per-user-limit check, and an
+idempotency check (every key sent twice, plus same-key/different-seats conflicts). It needs **Java 21+**
+and nothing else - no build step, no dependencies.
+
+```
+java Burst.java <BASE_URL> [ADMIN_SECRET] [--quick]
+
+# examples
+java Burst.java http://localhost:8080 --quick                     # ~700 requests, fast local check
+java Burst.java https://your-app.onrender.com admin-secret-change-me   # full ~20k-request stampede
+```
+
+It creates its own show, polls `/readyz` first (so it survives a cold start), prints the outcome
+distribution for every phase (confirmed / declined-by-reason / 5xx), then reconciles three
+independent views against each other: what the script itself observed, `GET /shows/{id}`, and the
+delta in `/metrics` taken before and after the run. It exits non-zero if any invariant from the
+assignment is violated (a seat double-sold, a 5xx, the per-user limit exceeded, a lost idempotent
+replay, or a reconciliation mismatch).
+
 (More sections - API, burst script, metrics, deploy - are added as the build progresses.)
