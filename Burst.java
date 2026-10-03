@@ -66,10 +66,20 @@ public class Burst {
     static final HttpClient HTTP = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NORMAL)   // follows /metrics -> /actuator/prometheus
             .connectTimeout(Duration.ofSeconds(10))
+            // Force HTTP/1.1: against an HTTP/2 host (Render sits behind Cloudflare), the default
+            // client multiplexes many virtual-thread requests as "streams" on one pooled connection
+            // and hits the server's per-connection concurrent-stream cap under this kind of fan-out.
+            // HTTP/1.1 gives each request its own connection, which is also closer to how a real
+            // stampede of independent buyers' browsers actually behaves.
+            .version(HttpClient.Version.HTTP_1_1)
             .build();
     static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(20);
 
     static boolean failed = false;
+    // Phase D reuses fixed key strings so both concurrent attempts share one key WITHIN a run;
+    // this makes them unique ACROSS separate runs too, so re-running the script against a live
+    // deployment (same persistent DB) doesn't collide with idempotency rows an earlier run left behind.
+    static final String RUN_ID = UUID.randomUUID().toString().substring(0, 8);
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
@@ -252,7 +262,7 @@ public class Burst {
         for (int i = 1; i <= idempotencyPairs; i++) {
             final String seat = "IDEM" + i;
             final String user = "idem-" + i;
-            final String key = "idem-key-" + i;
+            final String key = "idem-key-" + RUN_ID + "-" + i;
             for (int attempt = 0; attempt < 2; attempt++) {
                 tasks.add(() -> {
                     String token = mintToken(user, null);
@@ -272,7 +282,7 @@ public class Burst {
         int conflictSamples = Math.min(20, idempotencyPairs);
         for (int i = 1; i <= conflictSamples; i++) {
             final String user = "idem-" + i;
-            final String key = "idem-key-" + i;
+            final String key = "idem-key-" + RUN_ID + "-" + i;
             final String otherSeat = "IDEM" + ((i % idempotencyPairs) + 1);  // a different seat than key i's own
             conflictTasks.add(() -> {
                 String token = mintToken(user, null);
