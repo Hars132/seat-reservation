@@ -1,8 +1,11 @@
 package com.harshal.seats.service;
 
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -21,9 +24,21 @@ public class ShowService {
         """;
 
     private final JdbcTemplate jdbc;
+    private final MeterRegistry metrics;
+    // Holds a strong reference per show so its Gauge is never garbage-collected (Micrometer gauges
+    // hold the state object weakly). The value itself is unused; the map is just an anchor.
+    private final ConcurrentHashMap<UUID, UUID> gaugeAnchors = new ConcurrentHashMap<>();
 
-    public ShowService(JdbcTemplate jdbc) {
+    public ShowService(JdbcTemplate jdbc, MeterRegistry metrics) {
         this.jdbc = jdbc;
+        this.metrics = metrics;
+    }
+
+    /** Evaluated fresh on every Prometheus scrape (pull, not cached), so it can never drift from the DB. */
+    private int countAvailable(UUID showId) {
+        Integer n = jdbc.queryForObject(
+            "SELECT count(*) FROM seats WHERE show_id = ? AND status = 'available'", Integer.class, showId);
+        return n == null ? 0 : n;
     }
 
     /** Show row and all seats are created in one transaction: a show never exists half-built. */
@@ -38,6 +53,12 @@ public class ShowService {
             ps.setObject(1, id);
             ps.setArray(2, ps.getConnection().createArrayOf("text", arr));
         });
+        UUID anchor = gaugeAnchors.computeIfAbsent(id, k -> k);
+        Gauge.builder("seats_available", anchor, this::countAvailable)
+                .description("Seats currently available for a show")
+                .tag("show", id.toString())
+                .register(metrics);
+
         List<SeatView> seats = labels.stream().map(l -> new SeatView(l, "available")).toList();
         return ShowView.of(id.toString(), name, pricePaise, perUserLimit,
                 labels.size(), labels.size(), 0, 0, seats);

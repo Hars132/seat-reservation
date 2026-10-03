@@ -1,6 +1,8 @@
 package com.harshal.seats.service;
 
 import com.harshal.seats.web.ApiException;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -86,29 +88,65 @@ public class ReservationService {
     private final TransactionTemplate txTemplate;
     private final Semaphore gate;
     private final long queueTimeoutMs;
+    private final MeterRegistry metrics;
+    private final Counter confirmedCounter;
     // Price and per-user limit never change after creation, so caching them is safe.
     // Only positive lookups are cached; an unknown show is always re-checked.
     private final ConcurrentHashMap<UUID, ShowInfo> showCache = new ConcurrentHashMap<>();
 
     public ReservationService(JdbcTemplate jdbc,
                               TransactionTemplate txTemplate,
+                              MeterRegistry metrics,
                               @Value("${app.reserve.max-concurrency:16}") int maxConcurrency,
                               @Value("${app.reserve.queue-timeout-ms:20000}") long queueTimeoutMs) {
         this.jdbc = jdbc;
         this.txTemplate = txTemplate;
+        this.metrics = metrics;
         this.gate = new Semaphore(maxConcurrency, true);
         this.queueTimeoutMs = queueTimeoutMs;
+        this.confirmedCounter = Counter.builder("reservations_confirmed_total")
+                .description("Reservations that were newly confirmed (excludes idempotent replays)")
+                .register(metrics);
     }
 
-    /** Waits in memory (not on a DB connection) when the system is saturated. */
+    /**
+     * Waits in memory (not on a DB connection) when the system is saturated. Metrics are recorded
+     * AFTER the transaction returns (TransactionTemplate has already committed by then), so a
+     * confirmed/declined count always matches what was actually persisted.
+     */
     public ReserveOutcome reserve(UUID showId, String userId, String idempotencyKey, List<String> seats) {
         String hash = requestHash(showId, seats);
         acquire();
+        ReserveOutcome outcome;
         try {
-            return txTemplate.execute(status -> doReserve(status, showId, userId, idempotencyKey, hash, seats));
+            outcome = txTemplate.execute(status -> doReserve(status, showId, userId, idempotencyKey, hash, seats));
         } finally {
             gate.release();
         }
+        record(outcome);
+        return outcome;
+    }
+
+    /**
+     * reservations_declined_total{reason}: seat_taken, per_user_limit, unknown_seat,
+     * idempotency_conflict, idempotent_replay. A replay (whether of a confirmed or a declined
+     * original) is counted ONLY as idempotent_replay, per the brief's named reasons - it does not
+     * also double-count toward "confirmed" or the original decline reason.
+     */
+    private void record(ReserveOutcome outcome) {
+        switch (outcome) {
+            case ReserveOutcome.Created c -> {
+                if (c.replay()) declinedCounter("idempotent_replay").increment();
+                else confirmedCounter.increment();
+            }
+            case ReserveOutcome.Declined d -> {
+                declinedCounter(d.replay() ? "idempotent_replay" : d.reason()).increment();
+            }
+        }
+    }
+
+    private Counter declinedCounter(String reason) {
+        return metrics.counter("reservations_declined_total", "reason", reason);
     }
 
     private ReserveOutcome doReserve(TransactionStatus status, UUID showId, String userId,

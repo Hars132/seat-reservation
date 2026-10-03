@@ -48,3 +48,14 @@ management:
     web:
       exposure:
         include: health,prometheus,info
+  # Belt-and-braces: the Prometheus exporter is on by default once micrometer-registry-prometheus
+  # is on the classpath, but both property names below have existed across different Boot/Micrometer
+  # versions, so set both explicitly rather than rely on autodetection.
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
