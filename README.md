@@ -91,8 +91,10 @@ specifically (the JVM otherwise stalls trying IPv6 first inside Render's contain
 - **Health:** `GET /healthz` (liveness, never touches the DB) and `GET /readyz` (readiness, checks
   the DB and fails closed with 503 if it's unreachable).
 - **Logs:** structured JSON with a `request_id` on every line, viewable in Render's dashboard under
-  the service's Logs tab. (Render's free tier does not offer public/unauthenticated log sharing;
-  logs are available to whoever has dashboard access.)
+  the service's Logs tab. Render's free tier does not offer public/unauthenticated log sharing, so
+  as the brief's fallback option: **screen recording of the live logs under load** -
+  https://youtu.be/ISrk7DaoZv0 (Render's Logs tab streaming in real time while `Burst.java --quick`
+  runs against the live URL).
 
 ## Burst test (one command)
 `Burst.java` reproduces the on-sale stampede against a live (or local) URL: a general stampede with
