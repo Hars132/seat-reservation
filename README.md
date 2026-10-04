@@ -8,6 +8,55 @@ Java 21 · Spring Boot 3 · PostgreSQL · Flyway · Micrometer/Prometheus
 **Full write-up:** see [WRITEUP.md](WRITEUP.md) for the atomic decision, idempotency design,
 holds/expiry, the consistency-vs-availability tradeoff, observability, AI usage, and what's next.
 
+## Quick verification (5 minutes, copy-paste)
+
+Everything below runs against the **live URL** - no local setup needed. Replace `<ADMIN_SECRET>`
+with the value shared separately. If the very first command (health check) is slow, the free-tier
+instance was asleep; it will respond within ~90s and every command after that will be fast.
+
+```bash
+BASE=https://seat-reservation-7lwe.onrender.com
+ADMIN_SECRET=<paste here>
+
+# 1. Health - public, no token needed. (Hitting the bare URL "/" in a browser returns
+#    401 unauthorized - that's correct: identity is token-derived, not an open root page.)
+curl -s $BASE/healthz; echo
+curl -s $BASE/readyz; echo              # {"db":"UP","status":"UP"} = DB reachable, fully ready
+
+# 2. Mint an admin token (public endpoint)
+ADMIN_TOKEN=$(curl -s -X POST $BASE/auth/token -H 'Content-Type: application/json' \
+  -d "{\"user_id\":\"grader\",\"admin_secret\":\"$ADMIN_SECRET\"}" \
+  | sed -E 's/.*"token":"([^"]+)".*/\1/')
+
+# 3. Create a show (admin only)
+curl -s -X POST $BASE/shows -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"verify","seats":["A1","A2","A3"],"price_paise":25000}'
+# -> 201, id + 3 available seats. Copy the "id" for the next step.
+
+# 4. Reserve a seat as a normal user
+USER_TOKEN=$(curl -s -X POST $BASE/auth/token -H 'Content-Type: application/json' \
+  -d '{"user_id":"buyer1"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
+curl -s -X POST $BASE/shows/<show-id>/reserve -H "Authorization: Bearer $USER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"seats":["A1"],"idempotency_key":"k1"}'
+# -> 201 confirmed. Retry the exact same command: returns the SAME reservation (idempotent replay).
+```
+
+**Or skip all of the above and run the one-command burst test** (needs Java 21+, no build step,
+no dependencies - just run the file directly):
+```bash
+java Burst.java https://seat-reservation-7lwe.onrender.com <ADMIN_SECRET> --quick
+```
+This creates its own show, fires a few hundred concurrent requests across the hot-seat storm,
+per-user-limit, and idempotency checks, then reconciles the result against the live API and
+`/metrics`, and prints `PASS`/`FAIL`. Drop `--quick` for the full ~20,000-request stampede (takes
+~20-25 min on the free tier; results from a full run are in WRITEUP.md).
+
+**Metrics:** `curl -s $BASE/metrics` (public, Prometheus format)
+**Logs:** Render's free tier has no public log sharing; see the screen recording link in the
+submission email / in [WRITEUP.md](WRITEUP.md).
+
 ## Run locally
 ```
 docker compose up --build        # app on :8080, Postgres on :5432
