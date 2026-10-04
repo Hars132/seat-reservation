@@ -2,6 +2,12 @@
 
 Java 21 · Spring Boot 3 · PostgreSQL · Flyway · Micrometer/Prometheus
 
+**Live URL:** https://seat-reservation-7lwe.onrender.com
+(free tier - sleeps after ~15 min idle; cold start is ~85s, see WRITEUP.md)
+
+**Full write-up:** see [WRITEUP.md](WRITEUP.md) for the atomic decision, idempotency design,
+holds/expiry, the consistency-vs-availability tradeoff, observability, AI usage, and what's next.
+
 ## Run locally
 ```
 docker compose up --build        # app on :8080, Postgres on :5432
@@ -74,6 +80,19 @@ never reveals that a reservation exists if it isn't yours). Cancelling an alread
 is `409 already_cancelled`. On success the seats return to `available` and the user's quota is released.
 Matching is by `reservation_id`, not seat label, so a stale/late cancel can never release a seat that
 has since been re-confirmed under a new reservation.
+
+## Deploy, metrics & logs
+Deployed on Render as a Docker web service with a managed Postgres instance in the same region.
+Environment variables used: `DB_URL`, `DB_USER`, `DB_PASSWORD`, `JWT_SECRET`, `ADMIN_SECRET`,
+`DB_POOL_SIZE`. `JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true` is required on Render
+specifically (the JVM otherwise stalls trying IPv6 first inside Render's container network).
+
+- **Metrics:** `GET /metrics` (public, no auth) - Prometheus text format.
+- **Health:** `GET /healthz` (liveness, never touches the DB) and `GET /readyz` (readiness, checks
+  the DB and fails closed with 503 if it's unreachable).
+- **Logs:** structured JSON with a `request_id` on every line, viewable in Render's dashboard under
+  the service's Logs tab. (Render's free tier does not offer public/unauthenticated log sharing;
+  logs are available to whoever has dashboard access.)
 
 ## Burst test (one command)
 `Burst.java` reproduces the on-sale stampede against a live (or local) URL: a general stampede with

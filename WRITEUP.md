@@ -47,6 +47,34 @@ This system chooses **consistency**. Postgres is the single source of truth and 
 
 This is the only defensible choice for a seat sale: availability over consistency here would mean occasionally selling the same seat twice when a stale replica disagrees with reality, which directly violates the one invariant the whole exercise is built around.
 
+## Live results (Render free tier)
+
+Deployed at `https://seat-reservation-7lwe.onrender.com`. Two numbers worth stating plainly rather
+than glossing over, both measured directly against the live deployment, not a local simulation:
+
+- **Cold start: ~85 seconds** from a fully idle (15+ min) instance to `/readyz` returning
+  `200 {"db":"UP","status":"UP"}` on the first request, no retries needed. The app comes up healthy
+  every time I've tested it; `/readyz` never once returned a false "up" before the DB was actually
+  reachable, and never leaves the caller guessing - it simply fails closed with `503` until the
+  database is confirmed reachable, then flips to `200`.
+- **Sustained throughput: ~15 req/s** for the full `Burst.java` stampede (20,000 reserve requests
+  plus token minting, paced at 100 in-flight) over roughly 22 minutes, with **zero 5xx** the entire
+  run. That ceiling is the free tier's single shared vCPU, not the application logic - the same
+  Docker image handles the identical local load at 200-400+ req/s against Docker Desktop on a
+  laptop. I'm stating this plainly rather than letting a passing burst run imply this setup is
+  production-ready as deployed: a real on-sale event would need more than a free-tier single-core
+  box to absorb a genuine simultaneous stampede.
+
+The full (non-`--quick`) burst result against the live URL: 20,000 requests over 2,000 seats
+(exactly 2,000 confirmed, 18,000 clean `409 seat_taken`), a 500-user hot-seat storm (exactly 1
+winner), a 10-parallel-request per-user-limit check (capped at exactly 4), 300 idempotency pairs
+(300 originals + 300 replays, 20/20 same-key-different-seats conflicts correctly rejected), and a
+reconciliation that matched the script's own request counts, `GET /shows/{id}`, and the `/metrics`
+deltas to the unit. The one honest caveat: at this throughput ceiling, the end-to-end run took
+roughly 22 minutes to push all 20,000 requests through - correctness held throughout, but it's
+worth being upfront that "zero 5xx under load" here means zero 5xx at ~15 req/s sustained, not at
+whatever instantaneous arrival rate a real on-sale moment might produce against this specific host.
+
 ## Observability — what I'd get paged for at 2am
 
 - **Any 5xx rate above zero**, sustained for more than a few seconds. The design goal is that declines are always a clean 4xx; a 5xx means something is actually broken, not just contested.
